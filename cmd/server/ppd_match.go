@@ -31,6 +31,11 @@ const (
 	PPDSourceVendor PPDSource = "vendor"
 	// PPDSourceHPLIP 是 HP 官方开源驱动（hpcups / hpijs）。
 	PPDSourceHPLIP PPDSource = "hplip"
+	// PPDSourcePostScript 是纯 PostScript 类 PPD（如 printer-driver-postscript-hp
+	// 提供的 *_series-ps.ppd）。数据流走 pdftops→PostScript→打印机固件 PS 解释器，
+	// 老机型固件解释器兼容性风险高（issue #117：P2055d 偶发吐空白页）；
+	// 当同设备存在 HPLIP 光栅替代时，自动推荐应让位给光栅路径。
+	PPDSourcePostScript PPDSource = "postscript"
 	// PPDSourceEverywhere 是 IPP Everywhere 伪驱动（lpadmin -m everywhere），
 	// 属性由打印机自报，不存在型号错配风险。
 	PPDSourceEverywhere PPDSource = "everywhere"
@@ -160,6 +165,12 @@ func ppdSourceBonus(s PPDSource) int {
 		return 50
 	case PPDSourceHPLIP:
 		return 40
+	case PPDSourcePostScript:
+		// 低于 hplip：PS 路径多一层「打印机固件 PS 解释器」兼容性风险，
+		// 光栅路径（hpcups/hpijs）在服务端完成、可控。此分仅作同 tier 内
+		// tie-break——tier 差（≥150）远大于来源分差，不足以单独翻转排序，
+		// 真正让 HPLIP 胜出的是 pickAutoRecommend 的跳过逻辑（见下方）。
+		return 30
 	case PPDSourceEverywhere:
 		return 35
 	case PPDSourceFoomatic:
@@ -183,18 +194,20 @@ func ppdSourceRank(s PPDSource) int {
 		return 1
 	case PPDSourceHPLIP:
 		return 2
-	case PPDSourceEverywhere:
+	case PPDSourcePostScript:
 		return 3
-	case PPDSourceFoomatic:
+	case PPDSourceEverywhere:
 		return 4
-	case PPDSourceUnknown:
+	case PPDSourceFoomatic:
 		return 5
-	case PPDSourceGutenprint:
+	case PPDSourceUnknown:
 		return 6
-	case PPDSourceGeneric:
+	case PPDSourceGutenprint:
 		return 7
+	case PPDSourceGeneric:
+		return 8
 	}
-	return 8
+	return 9
 }
 
 // ppdSourceLabel 是给前端用的中文来源文案。放在后端是为了让 CLI / 日志 / 前端口径一致。
@@ -206,6 +219,8 @@ func ppdSourceLabel(s PPDSource) string {
 		return "厂商原厂驱动"
 	case PPDSourceHPLIP:
 		return "HP 官方开源驱动 (HPLIP)"
+	case PPDSourcePostScript:
+		return "PostScript 驱动（依赖打印机 PS 解释器，老机型可能不稳定）"
 	case PPDSourceEverywhere:
 		return "免驱动 IPP Everywhere（由打印机自报能力）"
 	case PPDSourceFoomatic:
@@ -502,6 +517,15 @@ func ClassifyPPDSource(name, makeModel string) PPDSource {
 		return PPDSourceHPLIP
 	}
 
+	// PostScript 类 PPD（postscript-hp 包）。文件名约定 *_series-ps.ppd / *-ps.ppd.gz，
+	// 用 ppd-name 的 "-ps.ppd" 子串识别（覆盖 .gz 后缀）；比描述里的 "PostScript" 字样
+	// 精确——后者会误伤所有提到 PostScript 的 PPD。必须在 vendor 判定之前，否则
+	// ppdNameHasVendorDir 会因 "HP/" 目录命中而归为 vendor，PS 路径就得不到低于
+	// HPLIP 的来源分与「依赖固件 PS 解释器」的风险标注（issue #117）。
+	if strings.Contains(lowerName, "-ps.ppd") || strings.Contains(lowerDesc, "postscript-hp") {
+		return PPDSourcePostScript
+	}
+
 	// 厂商原厂驱动：
 	//   - ppd-name 首段是厂商目录名（Canon/、Epson/、Brother/…）
 	//   - 或 ppd-name 以已知厂商驱动前缀开头（escpr:、openprinting-ppds:）
@@ -536,7 +560,7 @@ func ppdNameHasVendorDir(lowerName string) bool {
 var ppdVendorDriverMarkers = []string{
 	"capt", "ufr ii", "ufrii", "cnrcups", "cnpkbidi", "bizhub",
 	"esc/p-r", "escpr", "epson inkjet printer driver", "pxlmono",
-	"postscript-hp", "brother", "pcl6", "kpdl",
+	"brother", "pcl6", "kpdl",
 }
 
 // hasVendorDriverMarker 判断描述里是否含厂商专有驱动标识。
@@ -904,10 +928,18 @@ func ScorePPDCandidates(entries []PPDEntry, in MatchInput, topN int) []PPDCandid
 	for i := range out {
 		out[i].Confidence = ppdConfidence(out[i].Score)
 	}
-	// Recommended 只给 Top-1，且必须分数够、且不是 generic——
-	// 「推荐一条通用 PPD」在语义上就是错的。
-	if len(out) > 0 && out[0].Score >= 400 && out[0].Source != PPDSourceGeneric {
-		out[0].Recommended = true
+	// Recommended 只给「自动推荐选中的那条」，且分数够（medium+）、非 generic。
+	// 用 pickAutoRecommend 而非直接取 out[0]：Top-1 可能是 PostScript（靠 series 名
+	// 精确匹配拿了 tier 1000），但同设备有 HPLIP 光栅替代时，「推荐」徽章应给光栅路径，
+	// 让前端默认选中 HPLIP、setup 自动用 HPLIP（issue #117）。纯 PostScript 打印机
+	// 时 pickAutoRecommend 回退返回 PS，仍标推荐。
+	if auto, ok := pickAutoRecommend(out); ok {
+		for i := range out {
+			if out[i].PPD == auto.PPD {
+				out[i].Recommended = true
+				break
+			}
+		}
 	}
 	return out
 }
@@ -987,6 +1019,31 @@ func ppdConfidence(score int) string {
 		return ppdConfidenceMedium
 	}
 	return ppdConfidenceLow
+}
+
+// pickAutoRecommend 从已排序的候选列表里选出「自动推荐」的那一条。
+//
+// 决策优先级：
+//  1. 跳过 PostScript 与 generic 与 low，取第一个满足的——即「同设备有 HPLIP/光栅
+//     替代时让光栅路径胜出，不让 PostScript 靠 series 名精确匹配占 Top-1」(issue #117)。
+//  2. 回退：允许 PostScript（纯 PostScript 打印机无光栅替代时仍自动推荐 PS），
+//     但仍排除 generic 与 low。
+//  3. 都没有 → 返回 ok=false。
+//
+// 输入必须已稳定排序（ScorePPDCandidates 的产出），因此「第一个满足」即「最高分的满足」，
+// 结果与输入行顺序无关，不破坏「打乱输入稳定」不变量。
+func pickAutoRecommend(cands []PPDCandidate) (PPDCandidate, bool) {
+	for _, c := range cands {
+		if c.Source != PPDSourcePostScript && c.Source != PPDSourceGeneric && c.Confidence != ppdConfidenceLow {
+			return c, true
+		}
+	}
+	for _, c := range cands {
+		if c.Source != PPDSourceGeneric && c.Confidence != ppdConfidenceLow {
+			return c, true
+		}
+	}
+	return PPDCandidate{}, false
 }
 
 // ── 队列名去重 ─────────────────────────────────────────────────────────────────

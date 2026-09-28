@@ -684,6 +684,9 @@ func TestClassifyPPDSource(t *testing.T) {
 		{"foomatic-db-compressed-ppds:0/ppd/foomatic-ppd/HP-LaserJet_1020-foo2zjs.ppd", "HP LaserJet 1020 Foomatic/foo2zjs (recommended)", PPDSourceFoomatic},
 		{"drv:///hpijs.drv/hp-laserjet_1020-hpijs.ppd", "HP LaserJet 1020 hpijs, 3.22.10", PPDSourceHPLIP},
 		{"openprinting-ppds:0/ppd/openprinting/HP/LaserJet_1020.ppd", "HP LaserJet 1020, hpcups 3.23.12", PPDSourceHPLIP},
+		{"HP/hp-laserjet_p2055_series-ps.ppd", "HP LaserJet P2055 Series Postscript-hp", PPDSourcePostScript},
+		{"HP/hp-laserjet_p2055_series-ps.ppd.gz", "HP LaserJet P2055 Series", PPDSourcePostScript},
+		{"drv:///hpijs.drv/hp-laserjet_p2055d-pcl3.ppd", "HP LaserJet P2055d pcl3, hpcups 3.22.10", PPDSourceHPLIP},
 		{"Canon/CNRCUPSLBP2900CAPTK.ppd", "Canon LBP2900 CAPT ver.2.71", PPDSourceVendor},
 		{"escpr:0/cups/model/epson-inkjet-printer-escpr/Epson-L3250_Series.ppd", "EPSON L3250 Series, Epson Inkjet Printer Driver (ESC/P-R) for Linux", PPDSourceVendor},
 		{"drv:///brlaser.drv/br1510.ppd", "Brother DCP-1510 series, using Owl-Maintain/brlaser v6.2.7", PPDSourceVendor},
@@ -717,5 +720,79 @@ func TestNormalizeModelKey(t *testing.T) {
 		if compact != tt.wantCompact {
 			t.Errorf("NormalizeModelKey(%q).compact = %q, want %q", tt.input, compact, tt.wantCompact)
 		}
+	}
+}
+
+// ── 场景 22：HP LaserJet P2055d —— PostScript PPD 不应被自动推荐（issue #117）──
+
+func TestScorePPD_HPLaserJetP2055(t *testing.T) {
+	// P2055d 的 device-id 自报型号通常是 "P2055"（系列名，无 d）。
+	// PS PPD 文件名 *_series-ps.ppd 去掉 series 噪声后 compact="laserjetp2055" → 与
+	// device 精确匹配 tier 1000；HPLIP pcl3 PPD compact="laserjetp2055dpcl3" → 只能
+	// 边界匹配 tier 850。tier 差 150 远大于来源分差，单靠来源分无法翻转排序，
+	// 必须靠 pickAutoRecommend 跳过 PostScript（issue #117）。
+	entries := ParsePPDLines([]string{
+		"HP/hp-laserjet_p2055_series-ps.ppd HP LaserJet P2055 Series PostScript",
+		"drv:///hpijs.drv/hp-laserjet_p2055d-pcl3.ppd HP LaserJet P2055d pcl3, hpcups 3.22.10",
+	})
+	cands := ScorePPDCandidates(entries, MatchInput{
+		Manufacturer: "HP",
+		Model:        "LaserJet P2055",
+		PreferLang:   "zh",
+	}, 8)
+	if len(cands) < 2 {
+		t.Fatalf("expected >=2 candidates, got %d", len(cands))
+	}
+	// Top-1 仍是 PostScript（tier 1000 > HPLIP tier 850），排序逻辑没动
+	if cands[0].Source != PPDSourcePostScript {
+		t.Errorf("Top-1 should still be PostScript (higher tier), got %s (score=%d)",
+			cands[0].Source, cands[0].Score)
+	}
+	var psCand, hplipCand *PPDCandidate
+	for i := range cands {
+		switch cands[i].Source {
+		case PPDSourcePostScript:
+			psCand = &cands[i]
+		case PPDSourceHPLIP:
+			hplipCand = &cands[i]
+		}
+	}
+	if psCand == nil || hplipCand == nil {
+		t.Fatalf("missing PS or HPLIP candidate: ps=%v hplip=%v", psCand != nil, hplipCand != nil)
+	}
+	// PS 不应被标推荐徽章
+	if psCand.Recommended {
+		t.Error("PostScript candidate should NOT be Recommended when HPLIP alternative exists")
+	}
+	// HPLIP 光栅路径应被标推荐
+	if !hplipCand.Recommended {
+		t.Error("HPLIP candidate should be Recommended over PostScript (raster path is safer)")
+	}
+	// bestPPDFromCandidates（一键设置 / detect Top-1 自动选）应返回 HPLIP
+	if got := bestPPDFromCandidates(cands); got != hplipCand.PPD {
+		t.Errorf("bestPPDFromCandidates = %q, want HPLIP %q (raster over PostScript)", got, hplipCand.PPD)
+	}
+}
+
+// ── 场景 23：纯 PostScript 打印机无光栅替代时仍应自动推荐 PS（回归护栏）────
+
+func TestScorePPD_PurePostScriptFallback(t *testing.T) {
+	// 只有 PS PPD、无 HPLIP/光栅替代：pickAutoRecommend 回退分支应返回 PS
+	entries := ParsePPDLines([]string{
+		"HP/hp-laserjet_p2055_series-ps.ppd HP LaserJet P2055 Series PostScript",
+	})
+	cands := ScorePPDCandidates(entries, MatchInput{
+		Manufacturer: "HP",
+		Model:        "LaserJet P2055",
+		PreferLang:   "zh",
+	}, 8)
+	if len(cands) == 0 {
+		t.Fatal("expected candidate, got none")
+	}
+	if !cands[0].Recommended {
+		t.Error("pure-PostScript printer: Top-1 should still be Recommended (no raster alternative)")
+	}
+	if got := bestPPDFromCandidates(cands); got == "" {
+		t.Error("pure-PostScript printer: bestPPDFromCandidates should return the PS PPD, not empty")
 	}
 }

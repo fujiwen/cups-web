@@ -402,17 +402,16 @@ func matchPPDCandidates(ctx context.Context, logBuf *safeBuffer,
 	return cands, dlInfo, driverdMatched, nil
 }
 
-// bestPPDFromCandidates 从候选列表里取 Top-1 的 ppd-name（非 generic、非 low confidence）。
+// bestPPDFromCandidates 取自动推荐的 ppd-name（非 generic、非 low confidence；
+// 同设备存在非 PostScript 替代时跳过 PostScript——见 pickAutoRecommend，
+// issue #117：避免靠 series 名精确匹配占 Top-1 的 PS PPD 成为一键设置的 PPD）。
 // 返回空串表示没有可用的自动匹配。
 func bestPPDFromCandidates(cands []PPDCandidate) string {
-	if len(cands) == 0 {
+	auto, ok := pickAutoRecommend(cands)
+	if !ok {
 		return ""
 	}
-	top := cands[0]
-	if top.Source == PPDSourceGeneric || top.Confidence == ppdConfidenceLow {
-		return ""
-	}
-	return top.PPD
+	return auto.PPD
 }
 
 // ── 队列验证 ───────────────────────────────────────────────────────────────────

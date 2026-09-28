@@ -952,9 +952,20 @@ func adminSetupPrinterHandler(w http.ResponseWriter, r *http.Request) {
 			args = append(args, "-m", ppdURI)
 		}
 		lpadminErr := runDriverCommand(ctx, logBuf, "lpadmin", args...)
-		// -m everywhere 失败时自动降级重试一次 Top-1（lpadmin 失败时队列不会被创建，重试无副作用）。
+		// -m everywhere 失败时自动降级重试一次（lpadmin 失败时队列不会被创建，重试无副作用）。
+		// 不用 bestPPDFromCandidates：它在有非 PostScript 替代时会跳过 PostScript（issue #117），
+		// 但 everywhere 刚失败、此处需要任何可用候选兜底，包括 PostScript——跳过逻辑只作用于
+		// 「自动推荐首选」，不作用于 everywhere 失败后的降级。同时显式排除 everywhere 本身（刚失败）。
 		if lpadminErr != nil && ppdURI == "everywhere" && len(cands) > 0 {
-			if fallback := bestPPDFromCandidates(cands); fallback != "" {
+			var fallback string
+			for _, c := range cands {
+				if c.PPD == "everywhere" || c.Source == PPDSourceGeneric || c.Confidence == ppdConfidenceLow {
+					continue
+				}
+				fallback = c.PPD
+				break
+			}
+			if fallback != "" {
 				fmt.Fprintf(logBuf, "everywhere 失败，降级重试 PPD: %s\n", fallback)
 				args2 := []string{"-p", printerName, "-E", "-v", req.DeviceURI, "-m", fallback}
 				if err2 := runDriverCommand(ctx, logBuf, "lpadmin", args2...); err2 == nil {
